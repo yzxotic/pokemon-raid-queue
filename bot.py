@@ -1,6 +1,6 @@
-
 import os
 import sqlite3
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -16,7 +16,14 @@ db.execute("""
 CREATE TABLE IF NOT EXISTS queue (
     discord_id INTEGER PRIMARY KEY,
     trainer_name TEXT NOT NULL,
-    joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    joined_at TEXT NOT NULL
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS cooldowns (
+    discord_id INTEGER PRIMARY KEY,
+    joined_at TEXT NOT NULL
 )
 """)
 
@@ -27,6 +34,7 @@ CREATE TABLE IF NOT EXISTS panel (
     message_id INTEGER NOT NULL
 )
 """)
+
 db.commit()
 
 intents = discord.Intents.default()
@@ -37,8 +45,8 @@ view_registered = False
 
 def queue_rows():
     return db.execute(
-        "SELECT discord_id, trainer_name FROM queue "
-        "ORDER BY joined_at, discord_id"
+        "SELECT discord_id, trainer_name, joined_at "
+        "FROM queue ORDER BY joined_at, discord_id"
     ).fetchall()
 
 
@@ -47,15 +55,27 @@ def build_queue_embed():
 
     if rows:
         lines = []
-        for number, (discord_id, trainer_name) in enumerate(rows[:50], start=1):
+
+        for number, (discord_id, trainer_name, joined_at) in enumerate(
+            rows[:50], start=1
+        ):
+            joined_time = datetime.strptime(
+                joined_at, "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+
+            timestamp = int(joined_time.timestamp())
+
             lines.append(
-                f"**{number}.** <@{discord_id}> — `{discord.utils.escape_markdown(trainer_name)}`"
+                f"**{number}.** <@{discord_id}> — "
+                f"`{discord.utils.escape_markdown(trainer_name)}`\n"
+                f"🕒 Joined: <t:{timestamp}:f> "
+                f"(<t:{timestamp}:R>)"
             )
 
         if len(rows) > 50:
-            lines.append(f"\n...and {len(rows) - 50} more players.")
+            lines.append(f"...and {len(rows) - 50} more players.")
 
-        description = "\n".join(lines)
+        description = "\n\n".join(lines)
     else:
         description = "The queue is currently empty. Be the first to join!"
 
@@ -64,12 +84,14 @@ def build_queue_embed():
         description=description,
         color=discord.Color.green(),
     )
+
     embed.add_field(
         name="Players in Queue",
         value=str(len(rows)),
         inline=True,
     )
-    embed.set_footer(text="Press JOIN QUEUE or LEAVE QUEUE to update your position.")
+
+    embed.set_footer(text="JOIN QUEUE | LEAVE QUEUE")
     return embed
 
 
@@ -85,6 +107,7 @@ async def refresh_queue_panel():
 
     try:
         channel = bot.get_channel(channel_id)
+
         if channel is None:
             channel = await bot.fetch_channel(channel_id)
 
@@ -97,11 +120,13 @@ async def refresh_queue_panel():
 
     except discord.NotFound:
         print("Queue panel was deleted. Run /setup_panel again.")
+
     except discord.HTTPException as error:
         print("Could not update queue panel:", error)
 
 
 class TrainerNameModal(discord.ui.Modal, title="Join the Raid Queue"):
+
     trainer_name = discord.ui.TextInput(
         label="Pokemon GO Trainer Name",
         placeholder="Enter your in-game trainer name",
@@ -119,29 +144,66 @@ class TrainerNameModal(discord.ui.Modal, title="Join the Raid Queue"):
             )
             return
 
+        user_id = interaction.user.id
+
         existing = db.execute(
             "SELECT trainer_name FROM queue WHERE discord_id = ?",
-            (interaction.user.id,),
+            (user_id,),
         ).fetchone()
 
         if existing:
             await interaction.response.send_message(
-                f"You are already in the queue as **{existing[0]}**. "
-                "Use LEAVE QUEUE before joining again.",
+                f"You are already in the queue as **{existing[0]}**.",
                 ephemeral=True,
             )
             return
 
+        cooldown = db.execute(
+            "SELECT joined_at FROM cooldowns WHERE discord_id = ?",
+            (user_id,),
+        ).fetchone()
+
+        now = datetime.now(timezone.utc)
+
+        if cooldown:
+            previous_time = datetime.strptime(
+                cooldown[0], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+
+            elapsed = (now - previous_time).total_seconds()
+            remaining = 300 - elapsed
+
+            if remaining > 0:
+                available_time = int(previous_time.timestamp()) + 300
+
+                await interaction.response.send_message(
+                    "You must wait before joining again.\n"
+                    f"You can join <t:{available_time}:R>.",
+                    ephemeral=True,
+                )
+                return
+
+        joined_at = now.strftime("%Y-%m-%d %H:%M:%S")
+
         db.execute(
-            "INSERT INTO queue(discord_id, trainer_name) VALUES(?, ?)",
-            (interaction.user.id, name),
+            "INSERT INTO queue(discord_id, trainer_name, joined_at) "
+            "VALUES(?, ?, ?)",
+            (user_id, name, joined_at),
         )
+
+        db.execute(
+            "INSERT OR REPLACE INTO cooldowns(discord_id, joined_at) "
+            "VALUES(?, ?)",
+            (user_id, joined_at),
+        )
+
         db.commit()
 
         position = len(queue_rows())
 
         await interaction.response.send_message(
-            f"You joined as **{name}**. Your position is **#{position}**.",
+            f"You joined as **{name}**. "
+            f"Your position is **#{position}**.",
             ephemeral=True,
         )
 
@@ -149,6 +211,7 @@ class TrainerNameModal(discord.ui.Modal, title="Join the Raid Queue"):
 
 
 class QueuePanel(discord.ui.View):
+
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -212,10 +275,40 @@ async def on_ready():
 
 @bot.tree.command(
     name="setup_panel",
-    description="Post the permanent raid queue panel.",
+    description="Create or update the raid queue panel.",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setup_panel(interaction: discord.Interaction):
+
+    saved = db.execute(
+        "SELECT channel_id, message_id FROM panel WHERE id = 1"
+    ).fetchone()
+
+    if saved:
+        channel_id, message_id = saved
+
+        try:
+            channel = bot.get_channel(channel_id)
+
+            if channel is None:
+                channel = await bot.fetch_channel(channel_id)
+
+            message = await channel.fetch_message(message_id)
+
+            await message.edit(
+                embed=build_queue_embed(),
+                view=QueuePanel(),
+            )
+
+            await interaction.response.send_message(
+                "The original raid queue panel has been updated.",
+                ephemeral=True,
+            )
+            return
+
+        except discord.NotFound:
+            print("Old panel not found. Creating a new one.")
+
     await interaction.response.send_message(
         embed=build_queue_embed(),
         view=QueuePanel(),
@@ -230,13 +323,11 @@ async def setup_panel(interaction: discord.Interaction):
     )
     db.commit()
 
-    await message.edit(
-        embed=build_queue_embed(),
-        view=QueuePanel(),
-    )
 
-
-@bot.tree.command(name="queue", description="Show the global waiting list.")
+@bot.tree.command(
+    name="queue",
+    description="Show the global waiting list.",
+)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def show_queue(interaction: discord.Interaction):
     await interaction.response.send_message(
@@ -245,7 +336,10 @@ async def show_queue(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="remove", description="Remove a member from the queue.")
+@bot.tree.command(
+    name="remove",
+    description="Remove a member from the queue.",
+)
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(member="The Discord member to remove.")
 async def remove_player(
