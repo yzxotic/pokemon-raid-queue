@@ -277,7 +277,7 @@ async def on_ready():
     name="setup_panel",
     description="Create or update the raid queue panel.",
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_panel(interaction: discord.Interaction):
 
     saved = db.execute(
@@ -328,7 +328,7 @@ async def setup_panel(interaction: discord.Interaction):
     name="queue",
     description="Show the global waiting list.",
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def show_queue(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=build_queue_embed(),
@@ -340,7 +340,7 @@ async def show_queue(interaction: discord.Interaction):
     name="remove",
     description="Remove a member from the queue.",
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(member="The Discord member to remove.")
 async def remove_player(
     interaction: discord.Interaction,
